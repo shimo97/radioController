@@ -509,14 +509,14 @@ def rxSocketThread():
                         except:
                             pass
                             
-                    elif datastring.startswith("AOS"):
+                    elif datastring.startswith("AOS"): #AOS command
                         eventsqueue.put(("aos",1))
                         try:
                             rxconn.sendall(b'RPRT 0\n')
                         except:
                             pass
                     
-                    elif datastring.startswith("LOS"):
+                    elif datastring.startswith("LOS"): #LOS command
                         eventsqueue.put(("los",1))
                         try:
                             rxconn.sendall(b'RPRT 0\n')
@@ -539,19 +539,22 @@ def rxSocketThread():
                     variables["rxstate"]=1
                     guimutex.release()
 
+#initialization of rx socket thread
+rxsockThread=threading.Thread(target=rxSocketThread, daemon=True)
+
 #backend thread
 def backendThread():
 
     global guimutex 
     global txsocketaddr
     global postcmdtime
+    global rxsockThread
     
     #backend variables
     portName="" #currently connected port name
     portObj=None#port object
 
     txsock=None
-    rxsockThread=threading.Thread(target=rxSocketThread, daemon=True)
     oldFreq=0 #last tx frequency (to send only if new value is computed)
     
     p=pyaudio.PyAudio()
@@ -561,6 +564,7 @@ def backendThread():
     streamstate=0 #audio stream state (0:idle, 1:file opened, 2:stream ongoing, 3:waiting post stream time
     streamendtime=0
     
+    #callback for audio transmission
     def audioCB(in_data, frame_count, time_info, status):
         data = wavcmd.readframes(frame_count)
         return (data, pyaudio.paContinue)
@@ -658,13 +662,13 @@ def backendThread():
                     guimutex.acquire()
                     variables["txstate"]=1
                     guimutex.release()
-            elif event[0] == "freqsamp":
+            elif event[0] == "freqsamp": #new frequency received
                 if event[1] == 0: #minus button
                     if variables["numsamples"]>1:
                         variables["numsamples"]=variables["numsamples"]-1
                 else: #plus button
                     variables["numsamples"]=variables["numsamples"]+1
-            elif event[0] == "offtimein":
+            elif event[0] == "offtimein": #new offset time written
                 try:
                     variables["offtime"]=int(event[1])
                 except:
@@ -675,7 +679,7 @@ def backendThread():
                     guimutex.acquire()
                     variables["validofftime"]=1
                     guimutex.release()
-            elif event[0] == "folderbutt":
+            elif event[0] == "folderbutt": #scan foled button pressed
                 pathname=event[1].strip()
                 if os.path.isdir(pathname): #check if path is a directory
                     #extracting all wavs
@@ -688,7 +692,7 @@ def backendThread():
                     variables["wavnames"]=[]
                     guimutex.release()
                     
-            elif event[0] == "audiosel":
+            elif event[0] == "audiosel": #open audio button pressed
                 if streamstate==0 or streamstate==1:
                     try:
                         wavcmd=wave.open(os.path.join(pathname,event[1]),"r")
@@ -724,7 +728,7 @@ def backendThread():
                             guimutex.release()
                             streamstate=1
                             
-            elif event[0] == "cmdbutt":
+            elif event[0] == "cmdbutt": #send command button pressed
                 if streamstate==1:
                     streamstate=2
                     guimutex.acquire()
@@ -739,7 +743,7 @@ def backendThread():
                     else:
                         print("Sending command")
                         
-            elif event[0] == "matrixon" or (event[0]=="aos" and matrixRxCtrl):
+            elif event[0] == "matrixon" or (event[0]=="aos" and matrixRxCtrl): #matrix on button or AOS 
                 if event[0]=="aos":
                     print("AOS received")
                 try:
@@ -751,7 +755,7 @@ def backendThread():
                     variables["matrixstate"]=True
                     guimutex.release()
                     print("Matrix turned ON")
-            elif event[0] == "matrixoff" or (event[0]=="los" and matrixRxCtrl):
+            elif event[0] == "matrixoff" or (event[0]=="los" and matrixRxCtrl): #matrix off button or LOS
                 if event[0]=="los":
                     print("LOS received")
                 try:
@@ -763,11 +767,10 @@ def backendThread():
                     variables["matrixstate"]=False
                     guimutex.release()
                     print("Matrix turned OFF")
-            elif event[0] == "matrixcheck":
+            elif event[0] == "matrixcheck": #AOS/LOS receive checkbutton
                 matrixRxCtrl=event[1]
-                print("Matrixcheck {0}".format(matrixRxCtrl))
 
-            elif event[0] == "exit":
+            elif event[0] == "exit": #exit
                 print("Termination requested")
                 break
             
@@ -844,13 +847,20 @@ def backendThread():
         guimutex.release()
 
 print("Starting backend")
-daemon=threading.Thread(target=backendThread, daemon=True)
-daemon.start()
+backendthread=threading.Thread(target=backendThread, daemon=True)
+backendthread.start()
 
 def windowCloseCallback(): #callback for window closing
-    global daemon
-    eventsqueue.put(("exit",0))
-    daemon.join()
+    global backendthread, variables, rxsockthread
+    
+    eventsqueue.put(("exit",0)) #closing backend daemon
+    backendthread.join()
+    
+    guimutex.acquire() #closing socket daemon
+    variables["rxstate"] = 0
+    guimutex.release()
+    rxsockthread.join()
+    
     print("Bye!")
     root.destroy()
     sys.exit(0)

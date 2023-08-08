@@ -509,11 +509,19 @@ def rxSocketThread():
                         except:
                             pass
                             
-                    elif datastring.startswith("AOS"):
+                    elif datastring.startswith("AOS"): #AOS command
                         eventsqueue.put(("aos",1))
+                        try:
+                            rxconn.sendall(b'RPRT 0\n')
+                        except:
+                            pass
                     
-                    elif datastring.startswith("LOS"):
+                    elif datastring.startswith("LOS"): #LOS command
                         eventsqueue.put(("los",1))
+                        try:
+                            rxconn.sendall(b'RPRT 0\n')
+                        except:
+                            pass
                     
                     else: #if command not handled return a generic RPRT 0
                         try:
@@ -553,6 +561,7 @@ def backendThread():
     streamstate=0 #audio stream state (0:idle, 1:file opened, 2:stream ongoing, 3:waiting post stream time
     streamendtime=0
     
+    #callback for audio transmission
     def audioCB(in_data, frame_count, time_info, status):
         data = wavcmd.readframes(frame_count)
         return (data, pyaudio.paContinue)
@@ -757,7 +766,6 @@ def backendThread():
                     print("Matrix turned OFF")
             elif event[0] == "matrixcheck":
                 matrixRxCtrl=event[1]
-                print("Matrixcheck {0}".format(matrixRxCtrl))
 
             elif event[0] == "exit":
                 print("Termination requested")
