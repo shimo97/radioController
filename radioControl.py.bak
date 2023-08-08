@@ -1,0 +1,850 @@
+import tkinter as tk
+from tkinter import ttk
+from tkinter import *
+from tkinter import filedialog, font
+from PIL import ImageTk, Image
+import customWidgets as cw
+import time
+import serial.tools.list_ports
+import socket
+import sys
+import copy
+import pyaudio
+import wave
+import queue
+import threading
+import os
+import subprocess
+
+#USER CONFIGURATION
+rxsocketaddr=("127.0.0.1",4534) #socket from gpredict
+txsocketaddr=("127.0.0.1",4532) #socket to rig
+postcmdtime=100  #time from end of command stream and ptt going off (ms)
+
+#CONSTANTS
+imagepath="bigradio.png" #path to image
+
+#GUI SUBFRAMES
+class PTTFrame(Frame):
+    def serialconnbuttCB(self): #serial connection button callback
+        global eventsqueue
+        eventsqueue.put(("serialbutt",self.portselframe.getSelectedEntry()))
+
+    def pttbuttCB(self):    #PTT button callback
+        global eventsqueue
+        eventsqueue.put(("pttbutt",1))
+        
+    def matrixonbuttCB(self): #matrix on callback
+        global eventsqueue
+        eventsqueue.put(("matrixon",1))
+
+    def matrixoffbuttCB(self): #matrix off callback
+        global eventsqueue
+        eventsqueue.put(("matrixoff",0))
+        
+    def matrixcheckCB(self):
+        global eventsqueue
+        eventsqueue.put(("matrixcheck",self.matrixcheckframe.getCheckState()))
+        
+    def __init__(self, master):
+        Frame.__init__(self, master)
+        
+        self.titlelabel=Label(self, text="----- MANUAL CONTROL -----") #title label
+        self.titlelabel.pack(side=TOP, anchor=NW)
+        
+        #port selection subframe
+        self.portselframe=cw.SelectFrame(self,"PTT serial port: ",[],self.serialconnbuttCB)
+        self.portselframe.pack(side=TOP, anchor=NW)
+        
+        #connection state frame
+        self.serialstates=["Disconnected", "Connected"]
+        self.serialstatescolor=["#f00","#0f0"]
+        self.serialstateframe=cw.StatusFrame(self,"PTT Port state: ",self.serialstates,self.serialstatescolor)
+        self.serialstateframe.pack(side=TOP,anchor=NW)
+        
+        #PTT control frame
+        self.pttcontrolframe=Frame(self)
+        self.pttcontrolframe.pack(side=TOP, anchor=NW)
+        self.ptttitle=Label(self.pttcontrolframe, text="Manual PTT control: ")
+        self.ptttitle.pack(side=LEFT, anchor=NW)
+        self.pttbutt=ttk.Button(self.pttcontrolframe, text="PTT", command=self.pttbuttCB)
+        self.pttbutt.pack(side=LEFT, anchor=NW)
+        self.pttstates=["OFF", "ON"] #ptt state frame
+        self.pttstatescolor=["#f00","#0f0"]
+        self.pttstateframe=cw.StatusFrame(self.pttcontrolframe,"PTT state: ",self.pttstates,self.pttstatescolor)
+        self.pttstateframe.pack(side=LEFT,anchor=NW)
+        
+        #manual matrix control
+        self.matrixcontrolframe=Frame(self)
+        self.matrixcontrolframe.pack(side=TOP, anchor=NW)
+        self.matrixtitle=Label(self.matrixcontrolframe, text="Manual Matrix control: ")
+        self.matrixtitle.pack(side=LEFT, anchor=NW)
+        self.matrixonbutt=ttk.Button(self.matrixcontrolframe, text="ON", command=self.matrixonbuttCB)
+        self.matrixonbutt.pack(side=LEFT, anchor=NW)
+        self.matrixoffbutt=ttk.Button(self.matrixcontrolframe, text="OFF", command=self.matrixoffbuttCB)
+        self.matrixoffbutt.pack(side=LEFT, anchor=NW)
+        
+        #take matrix from gpredict LOS AOS
+        self.matrixcheckframe=cw.CheckFrame(self,"Command matrix from Gpredict AOS/LOS: ","Enable",self.matrixcheckCB)
+        self.matrixcheckframe.pack(side=TOP, anchor=NW)
+        
+        #matrix state
+        self.matrixstates=["OFF","CON"]
+        self.matrixstatescolor=["#f00","#0f0"]
+        self.matrixstateframe=cw.StatusFrame(self,"Matrix state (last set): ",self.matrixstates,self.matrixstatescolor)
+        self.matrixstateframe.pack(side=TOP,anchor=NW)
+        
+    def updatePorts(self,portslist):
+        self.portselframe.setMenuEntries(portslist)
+            
+    def setPort(self, portname):
+        self.portselframe.setSelectedEntry(portname)
+            
+    def updatePortState(self,portstate):
+        if portstate==1 or portstate==True:
+            self.serialstateframe.setStatusLabel(1)
+            self.portselframe.setButtonText("Disconnect")
+        else:
+            self.serialstateframe.setStatusLabel(0)
+            self.portselframe.setButtonText("Connect")
+            
+    def updatePTTState(self,pttstate):
+        if pttstate==1 or pttstate==True:
+            self.pttstateframe.setStatusLabel(1)
+        else:
+            self.pttstateframe.setStatusLabel(0)
+            
+    def updateMatrixState(self,matrixstate):
+        if matrixstate==1 or matrixstate==True:
+            self.matrixstateframe.setStatusLabel(1)
+        else:
+            self.matrixstateframe.setStatusLabel(0)
+            
+
+class OffsetFrame(Frame):
+    def rxcheckCB(self): #rx socket checkbox callback
+        global eventsqueue
+        eventsqueue.put(("rxcheck",self.rxcheckframe.getCheckState()))
+
+    def txcheckCB(self): #tx socket checkbox callback
+        global eventsqueue
+        eventsqueue.put(("txcheck",self.txcheckframe.getCheckState()))
+        
+    def plusButtCB(self):
+        global eventsqueue
+        eventsqueue.put(("freqsamp",1))
+    
+    def minusButtCB(self):
+        global eventsqueue
+        eventsqueue.put(("freqsamp",0))
+        
+    def offTimeCB(self):
+        global eventsqueue
+        eventsqueue.put(("offtimein",self.offtimeinput.getText()))
+        
+    def __init__(self, master):
+        Frame.__init__(self, master)
+        
+        self.titlelabel=Label(self, text="----- GPREDICT CONTROL -----") #title label
+        self.titlelabel.pack(side=TOP, anchor=NW)
+        
+        self.socketstates=["Disabled","Waiting...", "Connected"]
+        self.socketstatescolor=["#f00","#f80","#0f0"]
+        
+        #rx socket frame
+        self.rxcheckframe=cw.CheckFrame(self,"Gpredict socket: ","Enable",self.rxcheckCB)
+        self.rxcheckframe.pack(side=TOP, anchor=NW)
+        self.rxstateframe=cw.StatusFrame(self,"State: ",self.socketstates,self.socketstatescolor)
+        self.rxstateframe.pack(side=TOP,anchor=NW)
+        
+        #tx socket frame
+        self.txcheckframe=cw.CheckFrame(self,"Rig socket: ","Enable",self.txcheckCB)
+        self.txcheckframe.pack(side=TOP, anchor=NW)
+        self.txstateframe=cw.StatusFrame(self,"State: ",self.socketstates,self.socketstatescolor)
+        self.txstateframe.pack(side=TOP,anchor=NW)
+        
+        #frequency statistics
+        self.rxfreqlabel=cw.DoubleLabel(self,"Received frequency [Hz]: ")
+        self.rxfreqlabel.pack(side=TOP,anchor=NW,fill="x")
+        self.derivinput=cw.NumberBox(self,"Derivative average samples: ",minusCallback=self.minusButtCB, plusCallback=self.plusButtCB)
+        self.derivinput.pack(side=TOP,anchor=NW, fill="x")
+        self.freqderivlabel=cw.DoubleLabel(self,"Derivative [Hz/s]: ")
+        self.freqderivlabel.pack(side=TOP,anchor=NW,fill="x")
+        self.offtimeinput=cw.TextInput(self,"Offset time input [ms]: ",self.offTimeCB)
+        self.offtimeinput.pack(side=TOP,anchor=NW, fill="x")
+        self.offtimelabel=cw.DoubleLabel(self,"Used offset time [ms]: ")
+        self.offtimelabel.pack(side=TOP,anchor=NW,fill="x")
+        self.freqofflabel=cw.DoubleLabel(self,"Computed offset [Hz]: ")
+        self.freqofflabel.pack(side=TOP,anchor=NW,fill="x")
+        self.txfreqlabel=cw.DoubleLabel(self,"Set frequency [Hz]: ")
+        self.txfreqlabel.pack(side=TOP,anchor=NW,fill="x")
+        
+    def updateRXState(self,value):
+        self.rxstateframe.setStatusLabel(value)
+        
+    def updateTXState(self,value):
+        self.txstateframe.setStatusLabel(value)
+        
+    def updateRXFreq(self,value):
+        self.rxfreqlabel.setVarText(value)
+        
+    def updateTXFreq(self,value):
+        self.txfreqlabel.setVarText(value)
+        
+    def updateFreqDeriv(self,value):
+        self.freqderivlabel.setVarText(value)
+        
+    def updateFreqOff(self,value):
+        self.freqofflabel.setVarText(value)
+        
+    def updateFreqSamp(self,value):
+        self.derivinput.setValue(value)
+        
+    def updateOffTimeValid(self,value):
+        self.offtimeinput.setValid(value)
+        
+    def updateOffTime(self,value):
+        self.offtimelabel.setVarText(value)
+        
+
+class AudioFrame(Frame):
+
+    def folderCB(self):
+        pass
+
+    def folderButtCB(self):
+        global eventsqueue
+        eventsqueue.put(("folderbutt",self.folderpath.getText()))
+    
+    def audioSelCB(self):
+        global eventsqueue
+        eventsqueue.put(("audiosel",self.audioselframe.getSelectedEntry()))
+        
+    def cmdButtCB(self):
+        global eventsqueue
+        eventsqueue.put(("cmdbutt",1))
+    
+    def __init__(self, master):
+        Frame.__init__(self, master)
+        
+        self.titlelabel=Label(self, text="----- WAV COMMAND CONTROL -----") #title label
+        self.titlelabel.pack(side=TOP, anchor=NW)
+        
+        #folder path input
+        self.folderpath=cw.TextInput(self,"Folder path: ",self.folderCB)
+        self.folderpath.pack(side=TOP,anchor=NW, fill="x")
+        
+        #scan folder button
+        self.folderbutt=ttk.Button(self, text="Scan folder", command=self.folderButtCB)
+        self.folderbutt.pack(side=TOP,anchor=NW, fill="x")
+        
+        #audio selection
+        self.audioselframe=cw.SelectFrame(self,"Select cmd WAV: ",[],self.audioSelCB,buttontext="Open")
+        self.audioselframe.pack(side=TOP, anchor=NW)
+        
+        #open wav informations
+        self.openwavlabel=cw.DoubleLabel(self,"Open file: ")
+        self.openwavlabel.pack(side=TOP,anchor=NW,fill="x")
+        self.openwavdurlabel=cw.DoubleLabel(self,"Duration [ms]: ")
+        self.openwavdurlabel.pack(side=TOP,anchor=NW,fill="x")
+        
+        #send command button
+        self.cmdbutt=ttk.Button(self, text="SEND CMD", command=self.cmdButtCB)
+        self.cmdbutt.pack(side=TOP,anchor=NW, fill="x")
+        
+        
+    def updateWavs(self,wavlist):
+        self.audioselframe.setMenuEntries(wavlist)
+        if len(wavlist) != 0:
+            self.audioselframe.setSelectedEntry(wavlist[0])
+        else:
+            self.audioselframe.setSelectedEntry("")
+            
+    def updateCmdButtState(self, value): #lock/unlock command button
+        if value==0:
+            self.cmdbutt.config(state="disabled")
+        else:
+            self.cmdbutt.config(state="normal")
+            
+    def updateOpenWav(self,name): #set name of currently open wav
+        self.openwavlabel.setVarText(name)
+        
+    def updateOpenWavDur(self,name): #set name of currently open wav
+        self.openwavdurlabel.setVarText(name)
+
+#GUI CREATION
+#gui events queue
+eventsqueue=queue.Queue()
+
+#root frame
+root = tk.Tk()
+root.geometry("800x600")
+root.title("SUPER IPER GIGA ULTRA RADIO CONTROLLER")
+root.config(bg="LightBlue1")
+root.rowconfigure(0,weight=1)
+root.rowconfigure(1,weight=1)
+root.columnconfigure(0,weight=1)
+root.columnconfigure(1,weight=1)
+
+#root frame -> title frame
+titleframe=Frame(root)
+titleframe.grid(row=0,column=0,columnspan=2,sticky="nsew",padx=10,pady=10)
+titleframe.rowconfigure(0,weight=3)
+titleframe.columnconfigure(0,weight=1)
+
+#root frame -> title frame -> title text
+titletext=Label(titleframe, text="SUPER IPER GIGA\nULTRA RADIO CONTROLLER",font=('Arial bold', 26), fg="MediumPurple2", height=2)
+titletext.grid(row=0,column=0,sticky="nsew")
+
+#root frame -> image
+img=ImageTk.PhotoImage(Image.open(imagepath))
+imagelabel=Label(root, image=img, anchor="nw")
+imagelabel.grid(row=1,column=0,sticky="nsew")
+
+#root frame -> data frame
+dataframe=Frame(root)
+dataframe.grid(row=1,column=1,sticky="nsew")
+dataframe.columnconfigure(0,weight=1)
+dataframe.columnconfigure(1,weight=1)
+dataframe.rowconfigure(0,weight=1)
+dataframe.rowconfigure(1,weight=1)
+
+#PTT frame instance
+pttframe=PTTFrame(dataframe)
+pttframe.grid(row=0,column=0,sticky="nwes")
+
+#offset frame instance
+offsetframe=OffsetFrame(dataframe)
+offsetframe.grid(row=0,column=1,sticky="nwes",rowspan=2)
+
+#audio control instance
+audioframe=AudioFrame(dataframe)
+audioframe.grid(row=1,column=0,sticky="nwes")
+
+#gui update variables
+guimutex=threading.Lock() #mutex to lock variables
+
+#dictionary of variables protected by guimutex
+#each variable name (key) is associated with a tuple whose first element
+#is the variable number, the second one is the function to update it on the gui)
+variables={
+    "portnames":[],     #list of port names
+    "portstate":False,  #serial port connection state
+    "pttstate":False,   #ptt state
+    "rxstate":0,        #socket states (0:diabled, 1:waiting connection, 2:connected
+    "txstate":0,
+    "rxfreq":0,         #frequency received from rx socket
+    "txfreq":0,         #frequency transmitted to tx socket
+    "numsamples":1,     #number of samples to compute derivative average (numsamples+1 samples inside list)
+    "freqderiv":0,      #frequency variation derivative
+    "freqoff":0,        #frequency offset
+    "validofftime":1,   #offset time span is valid flag
+    "offtime":0,        #offset time
+    "wavnames":[],      #list of found wav files found
+    "openwav":"-",      #name of currently open wav
+    "openwavdur":"-",   #duration of currently open wav
+    "cmdready":0,       #command ready (and so state of command button)
+    "matrixstate":0,    #matrix state
+}
+
+#dictionary with functions to update the gui variables, the key must be the same of the variables dictionary
+variablesfunc={
+    "portnames":pttframe.updatePorts,
+    "portstate":pttframe.updatePortState,
+    "pttstate":pttframe.updatePTTState,
+    "rxstate":offsetframe.updateRXState,
+    "txstate":offsetframe.updateTXState,
+    "rxfreq":offsetframe.updateRXFreq,
+    "txfreq":offsetframe.updateTXFreq,
+    "numsamples":offsetframe.derivinput.setValue,
+    "freqderiv":offsetframe.updateFreqDeriv,
+    "freqoff":offsetframe.updateFreqOff,
+    "validofftime":offsetframe.updateOffTimeValid,
+    "offtime":offsetframe.updateOffTime,
+    "wavnames":audioframe.updateWavs,
+    "openwav":audioframe.updateOpenWav,
+    "openwavdur":audioframe.updateOpenWavDur,
+    "cmdready":audioframe.updateCmdButtState,
+    "matrixstate":pttframe.updateMatrixState,
+}
+
+variablesOld=copy.deepcopy(variables) #used to update gui only if changes occurred (reduces lag alot)
+
+firstupdate=1 #flag to perform first update at startup
+
+#function that updates gui taking new values from variables
+def guiupdate():
+
+    global pttframe
+    global root
+    global guimutex, variables, variablesOld, variablesfunc
+    global firstupdate
+    
+    if guimutex.acquire(timeout=10):
+        #output
+        for k,v in variables.items():
+            if variables[k] != variablesOld[k] or firstupdate:
+                if variablesfunc[k] != None:
+                    variablesfunc[k](variables[k])
+                variablesOld[k]=copy.copy(variables[k])
+
+        firstupdate=0
+        
+        guimutex.release()
+
+    root.after(100,guiupdate)
+
+print("GUI created")
+
+#receive socket thread, this is done in a separate thread to try maximizing the 
+#timestamp accuracy for frequency derivative computation
+def rxSocketThread():
+    global guimutex
+    global rxsocketaddr
+    global eventsqueue
+    
+    try:
+        rxsock=socket.socket(socket.AF_INET, socket.SOCK_STREAM)    #socket
+        rxsock.settimeout(0.1)
+        rxsock.bind(rxsocketaddr)
+        rxsock.listen()
+    except:
+        print("ERROR: cannot open rx socket")
+        guimutex.acquire()
+        variables["rxstate"]=0 #thread will be closed immediately inside loop
+        guimutex.release()
+    else:
+        print("Rx socket listening on port {0}".format(rxsocketaddr[1]))
+    
+    rxconn=None
+    rxaddr=None
+    
+    freqsamples=[]  #list of frequency samples (tuples time, frequency)
+    
+
+    while True:
+        guimutex.acquire()
+        tmprxstate=variables["rxstate"]
+        guimutex.release()
+        if tmprxstate == 0:
+            try:
+                rxconn.close()
+            except:
+                pass
+            print("Rx socket closed")
+            return
+            
+        if tmprxstate == 1: #waiting for connection
+            try:
+                rxconn, rxaddr = rxsock.accept()
+            except:
+                pass
+            else:
+                print("Rx connection established")
+                guimutex.acquire()
+                variables["rxstate"]=2
+                guimutex.release()
+        elif tmprxstate == 2:  #connection established
+            try:
+                data=rxconn.recv(1024)
+            except BlockingIOError: #we are working in nonblocking way, this is raised if no data avaiable
+                pass
+            except ConnectionAbortedError:
+                print("Rx connection closed by client")
+                try:
+                    rxconn.close()
+                except:
+                    pass
+                guimutex.acquire()
+                variables["rxstate"]=1
+                guimutex.release()
+            else: #if new data available
+                if data:
+                    datastring=data.decode('ASCII')
+                    if datastring.startswith("F "): #"F command"
+                        timestamp=time.time()
+                        try:
+                            rxconn.sendall(b'RPRT 0\n')
+                        except:
+                            pass
+                        
+                        rxfreq=0
+                        try:
+                            rxfreq=int(datastring[:-1].split()[1])
+                        except:
+                            pass
+                        else:
+                            guimutex.acquire()
+                            variables["rxfreq"]=rxfreq
+                            numsamples=variables["numsamples"]
+                            guimutex.release()
+                            freqsamples.append((timestamp, rxfreq)) #inserting received frequency in averaging list
+                            while len(freqsamples) > (numsamples+1): #if number of samples reached remove first element
+                                freqsamples.pop(0)
+                            
+                            tmpderiv=0
+                            #computing frequency derivative
+                            if len(freqsamples) <= 1:
+                                tmpderiv=0
+                            else:
+                                lastval=freqsamples[0]
+                                tmpderiv=0
+                                for t,f in freqsamples[1:]:
+                                    tmpderiv=tmpderiv+(f-lastval[1])/(t-lastval[0])
+                                    lastval=(t,f)
+                                tmpderiv=tmpderiv/(len(freqsamples)-1)
+                            
+                            guimutex.acquire()
+                            variables["freqderiv"]=round(tmpderiv)
+                            #computing offset
+                            variables["freqoff"]=round(variables["offtime"]/1000*tmpderiv)
+                            guimutex.release()
+                                
+                    elif datastring.startswith("f"): #"f command"
+                        guimutex.acquire()
+                        txstr="{0}\n".format(int(variables["rxfreq"]))
+                        guimutex.release()
+                        try:
+                            rxconn.sendall(txstr.encode('ASCII'))
+                        except:
+                            pass
+                            
+                    elif datastring.startswith("AOS"):
+                        print("AOS")
+                        eventsqueue.put(("aos",1))
+                    
+                    elif datastring.startswith("LOS"):
+                        print("LOS")
+                        eventsqueue.put(("los",1))
+                    
+                    else: #if command not handled return a generic RPRT 0
+                        try:
+                            rxconn.sendall(b'RPRT 0\n')
+                        except:
+                            pass
+                        
+                else:
+                    print("Rx connection closed by client")
+                    try:
+                        rxconn.close()
+                    except:
+                        pass
+                    guimutex.acquire()
+                    variables["rxstate"]=1
+                    guimutex.release()
+
+#backend thread
+def backendThread():
+
+    global guimutex 
+    global txsocketaddr
+    global postcmdtime
+    
+    #backend variables
+    portName="" #currently connected port name
+    portObj=None#port object
+
+    txsock=None
+    rxsockThread=threading.Thread(target=rxSocketThread, daemon=True)
+    oldFreq=0 #last tx frequency (to send only if new value is computed)
+    
+    p=pyaudio.PyAudio()
+    cmdstream=None
+    pathname=""
+    wavcmd=None
+    streamstate=0 #audio stream state (0:idle, 1:file opened, 2:stream ongoing, 3:waiting post stream time
+    streamendtime=0
+    
+    def audioCB(in_data, frame_count, time_info, status):
+        data = wavcmd.readframes(frame_count)
+        return (data, pyaudio.paContinue)
+    
+    matrixRxCtrl=0  #flag that is 1 if matrix has to be commanded from gpredict AOS/LOS
+    
+    #initialization
+    guimutex.acquire()
+    ports=serial.tools.list_ports.comports() #scan serial ports
+
+    for port in ports:
+        variables["portnames"].append(port.name)
+    guimutex.release()
+
+    while True:
+        #events management ##########################
+        try:
+            event=eventsqueue.get(timeout=0)
+        except:
+            pass
+        else:
+            if event[0]=="serialbutt": #serial port button pressed
+                #try connecting to serial port
+                guimutex.acquire()
+                tmpportstate=variables["portstate"]
+                guimutex.release()
+                if not tmpportstate:
+                    print("Try connecting to {0}".format(event[1]))
+                    portName=event[1]
+                    try:
+                        portObj=serial.Serial(portName,dsrdtr=True)
+                    except:
+                        print("ERROR: could not connect to {0}".format(portName))
+                        try:
+                            portObj.close()
+                        except:
+                            pass
+                    else:
+                        print("Connection established with {0}".format(portName))
+                        guimutex.acquire()
+                        variables["portstate"]=True
+                        guimutex.release()
+                        portObj.dtr=False
+                    guimutex.acquire()
+                    variables["pttstate"]=False
+                    guimutex.release()
+                else:
+                    print("Disconnecting from {0}".format(portName))
+                    try:
+                        portObj.dtr=False
+                        portObj.close()
+                    except:
+                        pass
+                    guimutex.acquire()
+                    variables["portstate"]=False
+                    variables["pttstate"]=False
+                    guimutex.release()
+            elif event[0]=="pttbutt": #ptt button pressed
+                guimutex.acquire()
+                if variables["portstate"]:
+                    if variables["pttstate"]:
+                        variables["pttstate"]=False
+                        print("PTT OFF")
+                    else:
+                        variables["pttstate"]=True
+                        print("PTT ON")
+                else:
+                    print("ERROR: No port connected")
+                guimutex.release()
+            elif event[0] == "rxcheck": #rx socket checkbox pressed
+                if event[1] == 0: #socket disabled
+                    guimutex.acquire()
+                    variables["rxstate"]=0
+                    guimutex.release()
+                else:   #socket enabled
+                    if rxsockThread.is_alive()==False:
+                        guimutex.acquire()
+                        variables["rxstate"]=1
+                        guimutex.release()
+                        rxsockThread=threading.Thread(target=rxSocketThread, daemon=True)
+                        rxsockThread.start()
+            elif event[0] == "txcheck": #tex socket checkbox pressed
+                if event[1] == 0: #socket disabled
+                    try:
+                        txsock.close()
+                    except:
+                        pass
+                
+                    print("Tx socket closed")
+                    guimutex.acquire()
+                    variables["txstate"]=0
+                    guimutex.release()
+                else:   #socket enabled
+                    print("Tx socket trying to connect to port {0}".format(txsocketaddr[1]))
+                    guimutex.acquire()
+                    variables["txstate"]=1
+                    guimutex.release()
+            elif event[0] == "freqsamp":
+                if event[1] == 0: #minus button
+                    if variables["numsamples"]>1:
+                        variables["numsamples"]=variables["numsamples"]-1
+                else: #plus button
+                    variables["numsamples"]=variables["numsamples"]+1
+            elif event[0] == "offtimein":
+                try:
+                    variables["offtime"]=int(event[1])
+                except:
+                    guimutex.acquire()
+                    variables["validofftime"]=0 #set invalid background
+                    guimutex.release()
+                else:
+                    guimutex.acquire()
+                    variables["validofftime"]=1
+                    guimutex.release()
+            elif event[0] == "folderbutt":
+                pathname=event[1].strip()
+                if os.path.isdir(pathname): #check if path is a directory
+                    #extracting all wavs
+                    filelist=[f for f in os.listdir(pathname) if (os.path.isfile(os.path.join(pathname,f)) and (f.endswith(".wav") or f.endswith(".WAV")))]
+                    guimutex.acquire()
+                    variables["wavnames"]=copy.copy(filelist)
+                    guimutex.release()
+                else:
+                    guimutex.acquire()
+                    variables["wavnames"]=[]
+                    guimutex.release()
+                    
+            elif event[0] == "audiosel":
+                if streamstate==0 or streamstate==1:
+                    try:
+                        wavcmd=wave.open(os.path.join(pathname,event[1]),"r")
+                    except:
+                        print("ERROR: cannot open file")
+                        guimutex.acquire()
+                        variables["cmdready"]=0
+                        variables["openwav"]="-"
+                        variables["openwavdur"]="-"
+                        guimutex.release()
+                    else:
+                        try:
+                            cmdstream=p.open(format = p.get_format_from_width(wavcmd.getsampwidth()),
+                                                                            channels = wavcmd.getnchannels(),
+                                                                            rate=wavcmd.getframerate(),
+                                                                            output = True,
+                                                                            start=False,
+                                                                            frames_per_buffer=4096,
+                                                                            stream_callback=audioCB)
+                        except:
+                            print("ERROR: cannot start audio stream")
+                            guimutex.acquire()
+                            variables["cmdready"]=0
+                            variables["openwav"]="-"
+                            variables["openwavdur"]="-"
+                            guimutex.release()
+                        else:
+                            print("Command ready")
+                            guimutex.acquire()
+                            variables["cmdready"]=1
+                            variables["openwav"]=event[1]
+                            variables["openwavdur"]=round(wavcmd.getnframes() / wavcmd.getframerate() *1000)
+                            guimutex.release()
+                            streamstate=1
+                            
+            elif event[0] == "cmdbutt":
+                if streamstate==1:
+                    streamstate=2
+                    guimutex.acquire()
+                    variables["pttstate"]=True
+                    guimutex.release()
+                    try:
+                        cmdstream.start_stream()
+                    except:
+                        guimutex.acquire()
+                        variables["pttstate"]=True
+                        guimutex.release()
+                    else:
+                        print("Sending command")
+                        
+            elif event[0] == "matrixon" or (event[0]=="aos" and matrixRxCtrl):
+                try:
+                    subprocess.Popen(["matrix_ON"])
+                except Exception as exc:
+                    print("matrix_ON command not found")
+                else:
+                    guimutex.acquire()
+                    variables["matrixstate"]=True
+                    guimutex.release()
+                    print("Matrix turned ON")
+            elif event[0] == "matrixoff" or (event[0]=="los" and matrixRxCtrl):
+                try:
+                    subprocess.Popen(["matrix_OFF"])
+                except:
+                    print("matrix_OFF command not found")
+                else:
+                    guimutex.acquire()
+                    variables["matrixstate"]=False
+                    guimutex.release()
+                    print("Matrix turned OFF")
+            elif event[0] == "matrixcheck":
+                matrixRxCtrl=event[1]
+
+            elif event[0] == "exit":
+                print("Termination requested")
+                break
+            
+        #loop ###################################à
+        guimutex.acquire()
+        if variables["pttstate"]:
+            try:
+                portObj.dtr=True
+            except:
+                pass
+        else:
+            try:
+                portObj.dtr=False
+            except:
+                pass
+        
+        
+        if variables["txstate"] == 1:
+            try:
+                txsock.close()
+            except:
+                pass
+        
+            try:
+                txsock=socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                txsock.settimeout(0.01)
+                txsock.connect(txsocketaddr)
+            except:
+                pass
+            else:
+                print("Tx connection established")
+                variables["txstate"]=2
+        elif variables["txstate"] == 2:
+            variables["txfreq"]=variables["rxfreq"]+variables["freqoff"]
+            if variables["txfreq"]!=oldFreq:
+                oldFreq=variables["txfreq"]
+                txstr="F {0}\n".format(int(variables["txfreq"]))
+                try:
+                    txsock.sendall(txstr.encode('ASCII'))
+                except ConnectionResetError:
+                    print("Tx connection closed by server")
+                    print("Tx socket trying to connect to port {0}".format(txsocketaddr[1]))
+                    variables["txstate"]=1
+                    #print("{0} {1}".format(type(ex).__name__, ex.args))
+                except:
+                    pass
+                pass
+                
+            #delete incoming data
+            try:
+                while txsock.recv(1024): pass
+            except:
+                pass
+                
+        streamFlag=1
+        try:
+            streamFlag=cmdstream.is_active()
+        except:
+            pass
+        if streamstate==2 and not streamFlag:
+            streamstate=3
+            streamendtime=time.time()*1000
+            try:
+                cmdstream.stop_stream()
+                wavcmd.rewind()
+            except:
+                pass
+            print("Stream terminated")
+        elif streamstate==3:
+            if (time.time()*1000 - streamendtime)>=postcmdtime:
+                variables["pttstate"]=False
+                streamstate=1
+                print("PTT released")
+        guimutex.release()
+
+print("Starting backend")
+daemon=threading.Thread(target=backendThread, daemon=True)
+daemon.start()
+
+def windowCloseCallback(): #callback for window closing
+    global daemon
+    eventsqueue.put(("exit",0))
+    daemon.join()
+    print("Bye!")
+    root.destroy()
+    sys.exit(0)
+root.protocol("WM_DELETE_WINDOW", windowCloseCallback)
+
+guiupdate()
+root.mainloop()
+
