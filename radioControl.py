@@ -732,6 +732,8 @@ def backendThread():
                         print("Sending command")
                         
             elif event[0] == "matrixon" or (event[0]=="aos" and matrixRxCtrl):
+                if event[0]=="aos":
+                    print("AOS received")
                 try:
                     subprocess.Popen(["matrix_ON"])
                 except Exception as exc:
@@ -742,6 +744,8 @@ def backendThread():
                     guimutex.release()
                     print("Matrix turned ON")
             elif event[0] == "matrixoff" or (event[0]=="los" and matrixRxCtrl):
+                if event[0]=="los":
+                    print("LOS received")
                 try:
                     subprocess.Popen(["matrix_OFF"])
                 except:

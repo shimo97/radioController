@@ -510,11 +510,9 @@ def rxSocketThread():
                             pass
                             
                     elif datastring.startswith("AOS"):
-                        print("AOS")
                         eventsqueue.put(("aos",1))
                     
                     elif datastring.startswith("LOS"):
-                        print("LOS")
                         eventsqueue.put(("los",1))
                     
                     else: #if command not handled return a generic RPRT 0
@@ -755,6 +753,7 @@ def backendThread():
                     print("Matrix turned OFF")
             elif event[0] == "matrixcheck":
                 matrixRxCtrl=event[1]
+                print("Matrixcheck {0}".format(matrixRxCtrl))
 
             elif event[0] == "exit":
                 print("Termination requested")
