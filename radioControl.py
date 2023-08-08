@@ -511,9 +511,17 @@ def rxSocketThread():
                             
                     elif datastring.startswith("AOS"):
                         eventsqueue.put(("aos",1))
+                        try:
+                            rxconn.sendall(b'RPRT 0\n')
+                        except:
+                            pass
                     
                     elif datastring.startswith("LOS"):
                         eventsqueue.put(("los",1))
+                        try:
+                            rxconn.sendall(b'RPRT 0\n')
+                        except:
+                            pass
                     
                     else: #if command not handled return a generic RPRT 0
                         try:
